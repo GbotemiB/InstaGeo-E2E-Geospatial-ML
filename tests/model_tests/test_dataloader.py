@@ -8,6 +8,7 @@ from PIL import Image
 
 from instageo.model.dataloader import (
     InstaGeoDataset,
+    apply_multispectral_color_jitter,
     crop_array,
     get_raster_data,
     load_data_from_csv,
@@ -16,6 +17,7 @@ from instageo.model.dataloader import (
     process_data,
     process_test,
     random_crop_and_flip,
+    random_crop_flip_and_color_jitter,
 )
 
 
@@ -209,3 +211,128 @@ def test_instageo_dataset():
     assert isinstance(label, torch.Tensor)
     assert im.shape == torch.Size([1, 1, 224, 224])
     assert label.shape == torch.Size([224, 224])
+
+
+def test_apply_multispectral_color_jitter():
+    """Test that color jitter is applied only to RGB channels."""
+    # Create 6-channel multispectral data (simulating Blue, Green, Red, NIR, SWIR1, SWIR2)
+    ims = [Image.new("L", (256, 256), color=50 + i * 10) for i in range(6)]
+    
+    # Store original pixel values for comparison
+    original_values = [np.array(im) for im in ims]
+    
+    # Apply color jitter
+    transformed_ims = apply_multispectral_color_jitter(ims)
+    
+    # Check that we get the same number of images back
+    assert len(transformed_ims) == 6
+    assert all(isinstance(im, Image.Image) for im in transformed_ims)
+    
+    # Check that all images have the same size
+    assert all(im.size == (256, 256) for im in transformed_ims)
+    
+    # Convert back to numpy for detailed checking
+    transformed_values = [np.array(im) for im in transformed_ims]
+    
+    # Check that NIR, SWIR1, SWIR2 channels (indices 3, 4, 5) are unchanged
+    for i in range(3, 6):
+        np.testing.assert_array_equal(
+            original_values[i], 
+            transformed_values[i],
+            err_msg=f"Channel {i} should be unchanged but was modified"
+        )
+
+
+def test_apply_multispectral_color_jitter_with_few_channels():
+    """Test color jitter behavior with fewer than 3 channels."""
+    # Create 2-channel data
+    ims = [Image.new("L", (256, 256), color=50 + i * 10) for i in range(2)]
+    
+    # Apply color jitter - should apply to all channels when < 3 channels
+    transformed_ims = apply_multispectral_color_jitter(ims)
+    
+    assert len(transformed_ims) == 2
+    assert all(isinstance(im, Image.Image) for im in transformed_ims)
+    assert all(im.size == (256, 256) for im in transformed_ims)
+
+
+def test_random_crop_flip_and_color_jitter():
+    """Test the combined augmentation function."""
+    # Create 6-channel multispectral data
+    ims = [Image.new("L", (256, 256), color=50 + i * 10) for i in range(6)]
+    label = Image.new("L", (256, 256), color=128)
+    
+    # Apply combined transformations
+    transformed_ims, transformed_label = random_crop_flip_and_color_jitter(
+        ims, label, im_size=224, apply_color_jitter=True
+    )
+    
+    # Check output types and dimensions
+    assert isinstance(transformed_ims, list)
+    assert isinstance(transformed_label, Image.Image)
+    assert len(transformed_ims) == 6
+    assert all(isinstance(im, Image.Image) for im in transformed_ims)
+    assert all(im.size == (224, 224) for im in transformed_ims)
+    assert transformed_label.size == (224, 224)
+
+
+def test_random_crop_flip_and_color_jitter_no_color():
+    """Test the combined augmentation function without color jitter."""
+    # Create 6-channel multispectral data
+    ims = [Image.new("L", (256, 256), color=50 + i * 10) for i in range(6)]
+    label = Image.new("L", (256, 256), color=128)
+    
+    # Store original values for the non-visible channels
+    original_values = [np.array(im) for im in ims[3:]]  # NIR, SWIR1, SWIR2
+    
+    # Apply transformations without color jitter
+    transformed_ims, transformed_label = random_crop_flip_and_color_jitter(
+        ims, label, im_size=224, apply_color_jitter=False
+    )
+    
+    # Check output dimensions
+    assert len(transformed_ims) == 6
+    assert all(im.size == (224, 224) for im in transformed_ims)
+    assert transformed_label.size == (224, 224)
+
+
+def test_process_and_augment_with_color_jitter():
+    """Test process_and_augment with color jitter enabled."""
+    x = np.random.rand(6, 256, 256).astype(np.float32) * 255
+    x = x.astype(np.uint8)  # Convert to uint8 for PIL Image compatibility
+    y = np.random.rand(256, 256).astype(np.float32) * 255
+    y = y.astype(np.uint8)
+    
+    processed_ims, processed_label = process_and_augment(
+        x, y, 
+        mean=[0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 
+        std=[1.0, 1.0, 1.0, 1.0, 1.0, 1.0], 
+        temporal_size=1, 
+        im_size=224,
+        augment=True,
+        apply_color_jitter=True
+    )
+
+    assert processed_ims.shape == torch.Size([6, 1, 224, 224])
+    assert processed_label.shape == torch.Size([224, 224])
+
+
+def test_process_and_augment_without_color_jitter():
+    """Test process_and_augment with color jitter disabled."""
+    x = np.random.rand(6, 256, 256).astype(np.float32) * 255
+    x = x.astype(np.uint8)  # Convert to uint8 for PIL Image compatibility
+    y = np.random.rand(256, 256).astype(np.float32) * 255
+    y = y.astype(np.uint8)
+    
+    processed_ims, processed_label = process_and_augment(
+        x, y, 
+        mean=[0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 
+        std=[1.0, 1.0, 1.0, 1.0, 1.0, 1.0], 
+        temporal_size=1, 
+        im_size=224,
+        augment=True,
+        apply_color_jitter=False
+    )
+
+    assert processed_ims.shape == torch.Size([6, 1, 224, 224])
+    assert processed_label.shape == torch.Size([224, 224])
