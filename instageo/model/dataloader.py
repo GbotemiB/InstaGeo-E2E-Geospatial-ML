@@ -87,33 +87,25 @@ def apply_multispectral_color_jitter(
     # For multispectral data with 3+ channels
     result_ims = []
     
-    # Create RGB composite from first 3 channels for color operations
+    # Convert first 3 channels to a format suitable for color jitter
     if len(ims) >= 3:
-        # Convert first 3 channels to RGB mode for color jitter
-        rgb_channels = []
-        for i in range(3):
-            # Convert to RGB mode if needed
-            if ims[i].mode != 'RGB':
-                # Convert single channel to RGB by duplicating across channels
-                rgb_im = Image.merge('RGB', [ims[i], ims[i], ims[i]])
-            else:
-                rgb_im = ims[i]
-            rgb_channels.append(rgb_im)
-        
-        # Apply color jitter to each RGB channel separately
+        # Apply color jitter to each RGB channel separately but consistently
         color_jitter = transforms.ColorJitter(
             brightness=brightness, contrast=contrast, saturation=saturation, hue=hue
         )
         
+        # Convert first 3 channels to RGB mode if needed and apply color jitter
         for i in range(3):
-            # Apply color jitter and extract the first channel back to grayscale
-            jittered_rgb = color_jitter(rgb_channels[i])
-            # Convert back to grayscale by taking the first channel
-            if jittered_rgb.mode == 'RGB':
-                jittered_gray = jittered_rgb.split()[0]
+            # Convert to RGB if not already
+            if ims[i].mode not in ['RGB', 'L']:
+                # Convert to L mode first for consistency
+                rgb_channel = ims[i].convert('L')
             else:
-                jittered_gray = jittered_rgb
-            result_ims.append(jittered_gray)
+                rgb_channel = ims[i]
+            
+            # Apply color jitter (works on L mode too)
+            jittered_channel = color_jitter(rgb_channel)
+            result_ims.append(jittered_channel)
         
         # Keep remaining channels unchanged (NIR, SWIR1, SWIR2, etc.)
         for i in range(3, len(ims)):
