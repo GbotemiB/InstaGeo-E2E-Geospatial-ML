@@ -33,7 +33,7 @@ import sklearn.metrics as metrics
 import torch
 import torch.nn as nn
 from omegaconf import DictConfig, OmegaConf
-from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 from pytorch_lightning.loggers import TensorBoardLogger
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
@@ -45,7 +45,7 @@ from instageo.model.dataloader import (
     process_test,
 )
 from instageo.model.infer_utils import chip_inference, sliding_window_inference
-from instageo.model.model import PrithviSeg
+from instageo.model.model import PrithviSeg, ImprovedPrithviSeg
 
 pl.seed_everything(seed=1042, workers=True)
 torch.backends.cudnn.deterministic = True
@@ -163,6 +163,10 @@ class PrithviSegmentationModule(pl.LightningModule):
         class_weights: List[float] = [1, 2],
         ignore_index: int = -100,
         weight_decay: float = 1e-2,
+        lr_scheduler: str = "cosine",  # "cosine", "reduce_on_plateau"
+        use_improved_model: bool = False,
+        use_attention: bool = True,
+        use_skip_connections: bool = True,
     ) -> None:
         """Initialization.
 
@@ -178,14 +182,30 @@ class PrithviSegmentationModule(pl.LightningModule):
             class_weights (List[float]): Class weights for mitigating class imbalance.
             ignore_index (int): Class index to ignore during loss computation.
             weight_decay (float): Weight decay for L2 regularization.
+            lr_scheduler (str): Type of learning rate scheduler to use.
+            use_improved_model (bool): Whether to use the improved model architecture.
+            use_attention (bool): Whether to use attention mechanisms in improved model.
+            use_skip_connections (bool): Whether to use skip connections in improved model.
         """
         super().__init__()
-        self.net = PrithviSeg(
-            image_size=image_size,
-            num_classes=num_classes,
-            temporal_step=temporal_step,
-            freeze_backbone=freeze_backbone,
-        )
+        
+        if use_improved_model:
+            self.net = ImprovedPrithviSeg(
+                image_size=image_size,
+                num_classes=num_classes,
+                temporal_step=temporal_step,
+                freeze_backbone=freeze_backbone,
+                use_attention=use_attention,
+                use_skip_connections=use_skip_connections,
+            )
+        else:
+            self.net = PrithviSeg(
+                image_size=image_size,
+                num_classes=num_classes,
+                temporal_step=temporal_step,
+                freeze_backbone=freeze_backbone,
+            )
+            
         weight_tensor = torch.tensor(class_weights).float() if class_weights else None
         self.criterion = nn.CrossEntropyLoss(
             ignore_index=ignore_index, weight=weight_tensor
@@ -193,6 +213,7 @@ class PrithviSegmentationModule(pl.LightningModule):
         self.learning_rate = learning_rate
         self.ignore_index = ignore_index
         self.weight_decay = weight_decay
+        self.lr_scheduler = lr_scheduler
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Define the forward pass of the model.
@@ -280,10 +301,27 @@ class PrithviSegmentationModule(pl.LightningModule):
         optimizer = torch.optim.AdamW(
             self.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay
         )
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            optimizer, T_0=10, T_mult=2, eta_min=0
-        )
-        return [optimizer], [scheduler]
+        
+        if self.lr_scheduler == "cosine":
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                optimizer, T_0=10, T_mult=2, eta_min=0
+            )
+            return [optimizer], [scheduler]
+        elif self.lr_scheduler == "reduce_on_plateau":
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer, mode='min', factor=0.5, patience=10, verbose=True
+            )
+            return {
+                'optimizer': optimizer,
+                'lr_scheduler': {
+                    'scheduler': scheduler,
+                    'monitor': 'val_loss',
+                    'interval': 'epoch',
+                    'frequency': 1
+                }
+            }
+        else:
+            return [optimizer]
 
     def log_metrics(
         self,
@@ -482,6 +520,45 @@ def compute_mean_std(data_loader: DataLoader) -> Tuple[List[float], List[float]]
     return mean.tolist(), std.tolist()  # type:ignore
 
 
+def compute_class_weights(dataset: Dataset) -> List[float]:
+    """Compute class weights for imbalanced datasets.
+    
+    Args:
+        dataset (Dataset): Training dataset to analyze.
+        
+    Returns:
+        List[float]: Class weights inversely proportional to class frequencies.
+    """
+    from collections import Counter
+    import torch
+    
+    # Collect all labels from the dataset
+    all_labels = []
+    for i in range(len(dataset)):
+        try:
+            _, label = dataset[i]
+            if isinstance(label, torch.Tensor):
+                all_labels.extend(label.flatten().tolist())
+            else:
+                all_labels.extend(label.flatten())
+        except Exception:
+            continue
+    
+    # Count classes
+    class_counts = Counter(all_labels)
+    total_samples = sum(class_counts.values())
+    num_classes = len(class_counts)
+    
+    # Compute weights (inverse frequency)
+    weights = []
+    for class_idx in sorted(class_counts.keys()):
+        if class_idx >= 0:  # Ignore negative indices (like ignore_index)
+            weight = total_samples / (num_classes * class_counts[class_idx])
+            weights.append(weight)
+    
+    return weights
+
+
 @hydra.main(config_path="configs", version_base=None, config_name="config")
 def main(cfg: DictConfig) -> None:
     """Runner Entry Point.
@@ -549,12 +626,17 @@ def main(cfg: DictConfig) -> None:
                 std=STD,
                 temporal_size=TEMPORAL_SIZE,
                 im_size=IM_SIZE,
+                apply_color_jitter=cfg.dataloader.get('apply_color_jitter', True),
+                apply_rotation=cfg.dataloader.get('apply_rotation', True),
+                rotation_degrees=cfg.dataloader.get('rotation_degrees', 10.0),
             ),
             bands=BANDS,
             replace_label=cfg.dataloader.replace_label,
             reduce_to_zero=cfg.dataloader.reduce_to_zero,
             no_data_value=cfg.dataloader.no_data_value,
             constant_multiplier=cfg.dataloader.constant_multiplier,
+            multi_scale_training=cfg.dataloader.get('multi_scale_training', False),
+            multi_scale_sizes=cfg.dataloader.get('multi_scale_sizes', [224, 256, 288, 320]),
         )
 
         valid_dataset = InstaGeoDataset(
@@ -566,6 +648,7 @@ def main(cfg: DictConfig) -> None:
                 std=STD,
                 temporal_size=TEMPORAL_SIZE,
                 im_size=IM_SIZE,
+                augment=False,  # No augmentation for validation
             ),
             bands=BANDS,
             replace_label=cfg.dataloader.replace_label,
@@ -579,15 +662,27 @@ def main(cfg: DictConfig) -> None:
         valid_loader = create_dataloader(
             valid_dataset, batch_size=batch_size, shuffle=False, num_workers=1
         )
+        
+        # Compute class weights if requested
+        class_weights = cfg.train.class_weights
+        if cfg.train.get('auto_class_weights', False):
+            computed_weights = compute_class_weights(train_dataset)
+            log.info(f"Computed class weights: {computed_weights}")
+            class_weights = computed_weights
+        
         model = PrithviSegmentationModule(
             image_size=IM_SIZE,
             learning_rate=cfg.train.learning_rate,
             freeze_backbone=cfg.model.freeze_backbone,
             num_classes=cfg.model.num_classes,
             temporal_step=cfg.dataloader.temporal_dim,
-            class_weights=cfg.train.class_weights,
+            class_weights=class_weights,
             ignore_index=cfg.train.ignore_index,
             weight_decay=cfg.train.weight_decay,
+            lr_scheduler=cfg.train.get('lr_scheduler', 'cosine'),
+            use_improved_model=cfg.model.get('use_improved_model', False),
+            use_attention=cfg.model.get('use_attention', True),
+            use_skip_connections=cfg.model.get('use_skip_connections', True),
         )
         hydra_out_dir = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
         checkpoint_callback = ModelCheckpoint(
@@ -598,13 +693,24 @@ def main(cfg: DictConfig) -> None:
             mode="max",
             save_top_k=3,
         )
+        
+        # Add early stopping if configured
+        callbacks = [checkpoint_callback]
+        if cfg.train.get('early_stopping', False):
+            early_stop_callback = EarlyStopping(
+                monitor="val_mIoU",
+                patience=cfg.train.get('early_stopping_patience', 15),
+                mode="max",
+                verbose=True,
+            )
+            callbacks.append(early_stop_callback)
 
         logger = TensorBoardLogger(hydra_out_dir, name="instageo")
 
         trainer = pl.Trainer(
             accelerator=get_device(),
             max_epochs=cfg.train.num_epochs,
-            callbacks=[checkpoint_callback],
+            callbacks=callbacks,
             logger=logger,
         )
 

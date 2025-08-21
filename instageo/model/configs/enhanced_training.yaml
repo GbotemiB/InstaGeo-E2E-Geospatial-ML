@@ -1,4 +1,4 @@
-# config.yaml
+# enhanced_training.yaml - Configuration demonstrating model improvements
 root_dir: null
 valid_filepath: null
 train_filepath: null
@@ -8,22 +8,22 @@ mode: train # train or eval
 
 train:
   learning_rate: 0.0001
-  num_epochs: 10
+  num_epochs: 50
   batch_size: 8
   class_weights: [1, 1]
-  auto_class_weights: false  # Automatically compute class weights from training data
+  auto_class_weights: true  # Automatically compute class weights from training data
   ignore_index: -100
   weight_decay: 0.01
-  lr_scheduler: "cosine"  # "cosine" or "reduce_on_plateau"
-  early_stopping: false
+  lr_scheduler: "reduce_on_plateau"  # Use ReduceLROnPlateau for better convergence
+  early_stopping: true
   early_stopping_patience: 15
 
 model:
   freeze_backbone: False
   num_classes: 2
-  use_improved_model: false  # Use enhanced model with skip connections and attention
-  use_attention: true  # Use attention mechanisms (only if use_improved_model=true)
-  use_skip_connections: true  # Use skip connections (only if use_improved_model=true)
+  use_improved_model: true  # Use enhanced model with skip connections and attention
+  use_attention: true  # Use attention mechanisms
+  use_skip_connections: true  # Use skip connections
 
 dataloader:
   bands: [1, 2, 3, 8, 11, 12] # Blue, Green, Red, Narrow NIR, SWIR 1, SWIR 2
@@ -35,12 +35,12 @@ dataloader:
   reduce_to_zero: False
   no_data_value: -9999
   constant_multiplier: 1.0
-  # Data augmentation settings
+  # Enhanced data augmentation settings
   apply_color_jitter: true
   apply_rotation: true
-  rotation_degrees: 10.0
+  rotation_degrees: 15.0  # Increased rotation range
   # Multi-scale training settings
-  multi_scale_training: false
+  multi_scale_training: true  # Enable multi-scale training
   multi_scale_sizes: [224, 256, 288, 320]
 
 test:
