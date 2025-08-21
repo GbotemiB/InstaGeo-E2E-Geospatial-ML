@@ -55,6 +55,73 @@ def open_mf_tiff_dataset(band_files: dict[str, Any]) -> xr.Dataset:
     return bands_dataset
 
 
+def apply_multispectral_color_jitter(
+    ims: List[Image.Image], 
+    brightness: float = 0.1, 
+    contrast: float = 0.1, 
+    saturation: float = 0.1, 
+    hue: float = 0.05
+) -> List[Image.Image]:
+    """Apply color jitter only to visible spectrum channels (RGB) of multispectral data.
+    
+    This function safely applies color augmentation to multispectral data by only
+    modifying the first three channels (Blue, Green, Red) while preserving the
+    non-visible spectrum channels (NIR, SWIR1, SWIR2) unchanged.
+    
+    Args:
+        ims (List[Image.Image]): List of PIL Image objects representing multispectral channels.
+        brightness (float): Brightness jitter factor.
+        contrast (float): Contrast jitter factor.  
+        saturation (float): Saturation jitter factor.
+        hue (float): Hue jitter factor.
+        
+    Returns:
+        List[Image.Image]: List of images with color jitter applied only to RGB channels.
+    """
+    if len(ims) < 3:
+        # For fewer than 3 channels, only apply brightness and contrast
+        # (saturation and hue don't make sense for grayscale)
+        color_jitter = transforms.ColorJitter(brightness=brightness, contrast=contrast)
+        return [color_jitter(im) for im in ims]
+    
+    # For multispectral data with 3+ channels
+    result_ims = []
+    
+    # Create RGB composite from first 3 channels for color operations
+    if len(ims) >= 3:
+        # Convert first 3 channels to RGB mode for color jitter
+        rgb_channels = []
+        for i in range(3):
+            # Convert to RGB mode if needed
+            if ims[i].mode != 'RGB':
+                # Convert single channel to RGB by duplicating across channels
+                rgb_im = Image.merge('RGB', [ims[i], ims[i], ims[i]])
+            else:
+                rgb_im = ims[i]
+            rgb_channels.append(rgb_im)
+        
+        # Apply color jitter to each RGB channel separately
+        color_jitter = transforms.ColorJitter(
+            brightness=brightness, contrast=contrast, saturation=saturation, hue=hue
+        )
+        
+        for i in range(3):
+            # Apply color jitter and extract the first channel back to grayscale
+            jittered_rgb = color_jitter(rgb_channels[i])
+            # Convert back to grayscale by taking the first channel
+            if jittered_rgb.mode == 'RGB':
+                jittered_gray = jittered_rgb.split()[0]
+            else:
+                jittered_gray = jittered_rgb
+            result_ims.append(jittered_gray)
+        
+        # Keep remaining channels unchanged (NIR, SWIR1, SWIR2, etc.)
+        for i in range(3, len(ims)):
+            result_ims.append(ims[i])
+    
+    return result_ims
+
+
 def random_crop_and_flip(
     ims: List[Image.Image], label: Image.Image, im_size: int
 ) -> Tuple[List[Image.Image], Image.Image]:
@@ -116,6 +183,45 @@ def normalize_and_convert_to_tensor(
     return ims_tensor, label
 
 
+def random_crop_flip_and_color_jitter(
+    ims: List[Image.Image], 
+    label: Image.Image, 
+    im_size: int,
+    apply_color_jitter: bool = True,
+    brightness: float = 0.1,
+    contrast: float = 0.1, 
+    saturation: float = 0.1,
+    hue: float = 0.05
+) -> Tuple[List[Image.Image], Image.Image]:
+    """Apply random cropping, flipping, and color jitter transformations.
+    
+    This function combines geometric transformations (crop, flip) with color augmentation
+    that is safe for multispectral data by only applying color jitter to RGB channels.
+
+    Args:
+        ims (List[Image.Image]): List of PIL Image objects representing the images.
+        label (Image.Image): A PIL Image object representing the label.
+        im_size (int): Target size for random crop.
+        apply_color_jitter (bool): Whether to apply color jitter augmentation.
+        brightness (float): Brightness jitter factor.
+        contrast (float): Contrast jitter factor.
+        saturation (float): Saturation jitter factor.
+        hue (float): Hue jitter factor.
+
+    Returns:
+        Tuple[List[Image.Image], Image.Image]: A tuple containing the transformed list of
+        images and label.
+    """
+    # Apply color jitter first (before geometric transforms to preserve spatial consistency)
+    if apply_color_jitter and random.random() > 0.5:
+        ims = apply_multispectral_color_jitter(ims, brightness, contrast, saturation, hue)
+    
+    # Apply geometric transformations (crop and flip)
+    ims, label = random_crop_and_flip(ims, label, im_size)
+    
+    return ims, label
+
+
 def process_and_augment(
     x: np.ndarray,
     y: np.ndarray | None,
@@ -124,6 +230,7 @@ def process_and_augment(
     temporal_size: int = 1,
     im_size: int = 224,
     augment: bool = True,
+    apply_color_jitter: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Process and augment the given images and labels.
 
@@ -133,7 +240,9 @@ def process_and_augment(
         mean (List[float]): The mean of each channel in the image
         std (List[float]): The standard deviation of each channel in the image
         temporal_size: The number of temporal steps
+        im_size: Target size for images after augmentation
         augment: Flag to perform augmentations in training mode.
+        apply_color_jitter: Flag to apply color jitter augmentation for multispectral data.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: A tuple of tensors representing the processed
@@ -146,7 +255,9 @@ def process_and_augment(
     if y is not None:
         label = Image.fromarray(y.copy().squeeze())
     if augment:
-        ims, label = random_crop_and_flip(ims, label, im_size)
+        ims, label = random_crop_flip_and_color_jitter(
+            ims, label, im_size, apply_color_jitter=apply_color_jitter
+        )
     ims, label = normalize_and_convert_to_tensor(ims, label, mean, std, temporal_size)
     return ims, label
 
