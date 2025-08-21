@@ -87,33 +87,25 @@ def apply_multispectral_color_jitter(
     # For multispectral data with 3+ channels
     result_ims = []
     
-    # Create RGB composite from first 3 channels for color operations
+    # Convert first 3 channels to a format suitable for color jitter
     if len(ims) >= 3:
-        # Convert first 3 channels to RGB mode for color jitter
-        rgb_channels = []
-        for i in range(3):
-            # Convert to RGB mode if needed
-            if ims[i].mode != 'RGB':
-                # Convert single channel to RGB by duplicating across channels
-                rgb_im = Image.merge('RGB', [ims[i], ims[i], ims[i]])
-            else:
-                rgb_im = ims[i]
-            rgb_channels.append(rgb_im)
-        
-        # Apply color jitter to each RGB channel separately
+        # Apply color jitter to each RGB channel separately but consistently
         color_jitter = transforms.ColorJitter(
             brightness=brightness, contrast=contrast, saturation=saturation, hue=hue
         )
         
+        # Convert first 3 channels to RGB mode if needed and apply color jitter
         for i in range(3):
-            # Apply color jitter and extract the first channel back to grayscale
-            jittered_rgb = color_jitter(rgb_channels[i])
-            # Convert back to grayscale by taking the first channel
-            if jittered_rgb.mode == 'RGB':
-                jittered_gray = jittered_rgb.split()[0]
+            # Convert to RGB if not already
+            if ims[i].mode not in ['RGB', 'L']:
+                # Convert to L mode first for consistency
+                rgb_channel = ims[i].convert('L')
             else:
-                jittered_gray = jittered_rgb
-            result_ims.append(jittered_gray)
+                rgb_channel = ims[i]
+            
+            # Apply color jitter (works on L mode too)
+            jittered_channel = color_jitter(rgb_channel)
+            result_ims.append(jittered_channel)
         
         # Keep remaining channels unchanged (NIR, SWIR1, SWIR2, etc.)
         for i in range(3, len(ims)):
@@ -188,25 +180,29 @@ def random_crop_flip_and_color_jitter(
     label: Image.Image, 
     im_size: int,
     apply_color_jitter: bool = True,
+    apply_rotation: bool = True,
     brightness: float = 0.1,
     contrast: float = 0.1, 
     saturation: float = 0.1,
-    hue: float = 0.05
+    hue: float = 0.05,
+    rotation_degrees: float = 10.0
 ) -> Tuple[List[Image.Image], Image.Image]:
-    """Apply random cropping, flipping, and color jitter transformations.
+    """Apply random cropping, flipping, rotation, and color jitter transformations.
     
-    This function combines geometric transformations (crop, flip) with color augmentation
-    that is safe for multispectral data by only applying color jitter to RGB channels.
+    This function combines geometric transformations (crop, flip, rotation) with color 
+    augmentation that is safe for multispectral data by only applying color jitter to RGB channels.
 
     Args:
         ims (List[Image.Image]): List of PIL Image objects representing the images.
         label (Image.Image): A PIL Image object representing the label.
         im_size (int): Target size for random crop.
         apply_color_jitter (bool): Whether to apply color jitter augmentation.
+        apply_rotation (bool): Whether to apply random rotation.
         brightness (float): Brightness jitter factor.
         contrast (float): Contrast jitter factor.
         saturation (float): Saturation jitter factor.
         hue (float): Hue jitter factor.
+        rotation_degrees (float): Range of degrees to randomly rotate.
 
     Returns:
         Tuple[List[Image.Image], Image.Image]: A tuple containing the transformed list of
@@ -215,6 +211,13 @@ def random_crop_flip_and_color_jitter(
     # Apply color jitter first (before geometric transforms to preserve spatial consistency)
     if apply_color_jitter and random.random() > 0.5:
         ims = apply_multispectral_color_jitter(ims, brightness, contrast, saturation, hue)
+    
+    # Apply rotation before cropping to avoid edge artifacts
+    if apply_rotation and random.random() > 0.5:
+        angle = random.uniform(-rotation_degrees, rotation_degrees)
+        ims = [transforms.functional.rotate(im, angle, expand=False, fill=0) for im in ims]
+        if label is not None:
+            label = transforms.functional.rotate(label, angle, expand=False, fill=0)
     
     # Apply geometric transformations (crop and flip)
     ims, label = random_crop_and_flip(ims, label, im_size)
@@ -231,6 +234,8 @@ def process_and_augment(
     im_size: int = 224,
     augment: bool = True,
     apply_color_jitter: bool = True,
+    apply_rotation: bool = True,
+    rotation_degrees: float = 10.0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Process and augment the given images and labels.
 
@@ -243,6 +248,8 @@ def process_and_augment(
         im_size: Target size for images after augmentation
         augment: Flag to perform augmentations in training mode.
         apply_color_jitter: Flag to apply color jitter augmentation for multispectral data.
+        apply_rotation: Flag to apply rotation augmentation.
+        rotation_degrees: Range of degrees for random rotation.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: A tuple of tensors representing the processed
@@ -256,7 +263,10 @@ def process_and_augment(
         label = Image.fromarray(y.copy().squeeze())
     if augment:
         ims, label = random_crop_flip_and_color_jitter(
-            ims, label, im_size, apply_color_jitter=apply_color_jitter
+            ims, label, im_size, 
+            apply_color_jitter=apply_color_jitter,
+            apply_rotation=apply_rotation,
+            rotation_degrees=rotation_degrees
         )
     ims, label = normalize_and_convert_to_tensor(ims, label, mean, std, temporal_size)
     return ims, label
@@ -472,6 +482,8 @@ class InstaGeoDataset(torch.utils.data.Dataset):
         constant_multiplier: float,
         bands: List[int] | None = None,
         include_filenames: bool = False,
+        multi_scale_sizes: List[int] | None = None,
+        multi_scale_training: bool = False,
     ):
         """Dataset Class for loading and preprocessing the dataset.
 
@@ -485,6 +497,8 @@ class InstaGeoDataset(torch.utils.data.Dataset):
             replace_label (Tuple): Tuple of value to replace and the replacement value.
             constant_multiplier (float): Constant multiplier for image.
             include_filenames (bool): Flag that determines whether to return filenames.
+            multi_scale_sizes (List[int]): List of image sizes for multi-scale training.
+            multi_scale_training (bool): Whether to enable multi-scale training.
 
         """
         self.input_root = input_root
@@ -496,6 +510,35 @@ class InstaGeoDataset(torch.utils.data.Dataset):
         self.reduce_to_zero = reduce_to_zero
         self.constant_multiplier = constant_multiplier
         self.include_filenames = include_filenames
+        
+        # Multi-scale training support
+        self.multi_scale_training = multi_scale_training
+        self.multi_scale_sizes = multi_scale_sizes or [224, 256, 288, 320]
+        self.current_scale_idx = 0
+
+    def set_scale(self, scale_idx: int) -> None:
+        """Set the current scale index for multi-scale training.
+        
+        Args:
+            scale_idx (int): Index into the multi_scale_sizes list.
+        """
+        if self.multi_scale_training and 0 <= scale_idx < len(self.multi_scale_sizes):
+            self.current_scale_idx = scale_idx
+
+    def get_current_image_size(self) -> int:
+        """Get the current image size for multi-scale training.
+        
+        Returns:
+            int: Current image size.
+        """
+        if self.multi_scale_training:
+            return self.multi_scale_sizes[self.current_scale_idx]
+        # Extract size from preprocess_func if it has im_size parameter
+        import inspect
+        sig = inspect.signature(self.preprocess_func)
+        if 'im_size' in sig.parameters:
+            return sig.parameters['im_size'].default or 224
+        return 224
 
     def __getitem__(self, i: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """Retrieves a sample from dataset.
@@ -517,10 +560,35 @@ class InstaGeoDataset(torch.utils.data.Dataset):
             bands=self.bands,
             constant_multiplier=self.constant_multiplier,
         )
-        if self.include_filenames:
-            return self.preprocess_func(arr_x, arr_y), im_fname
+        
+        # For multi-scale training, we need to call the preprocess function with dynamic size
+        if self.multi_scale_training:
+            import inspect
+            import random
+            from functools import partial
+            
+            # Randomly select a scale for this sample
+            scale_idx = random.randint(0, len(self.multi_scale_sizes) - 1)
+            current_size = self.multi_scale_sizes[scale_idx]
+            
+            # Check if preprocess_func supports im_size parameter
+            sig = inspect.signature(self.preprocess_func)
+            if 'im_size' in sig.parameters:
+                # Create a modified preprocess function with current size
+                modified_preprocess = partial(
+                    self.preprocess_func.func, 
+                    **{**self.preprocess_func.keywords, 'im_size': current_size}
+                )
+                result = modified_preprocess(arr_x, arr_y)
+            else:
+                result = self.preprocess_func(arr_x, arr_y)
         else:
-            return self.preprocess_func(arr_x, arr_y)
+            result = self.preprocess_func(arr_x, arr_y)
+            
+        if self.include_filenames:
+            return result, im_fname
+        else:
+            return result
 
     def __len__(self) -> int:
         """Return length of dataset."""
